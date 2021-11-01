@@ -1,11 +1,110 @@
+{-------------------------------------------------------------------------------
+
+  This Source Code Form is subject to the terms of the Mozilla Public
+  License, v. 2.0. If a copy of the MPL was not distributed with this
+  file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+-------------------------------------------------------------------------------}
+{===============================================================================
+
+  TaggedBinaryData
+
+    Set of simple classes (descendants of TStream) intended for serialization
+    and deserialization of binary data into/from streams.
+
+    Each data point is stored with its tag and the tagged values are split
+    into groups called contexts.
+
+    Tag is an 8bit integer (byte) that can have value between 0 and 254. Value
+    of 255 is reserved for a context tag - this tag signals that next byte(s)
+    are not data, but a new context.
+    Context is a 16bit integer that can be set to any value (none is reserved).
+    Since the tag has very limited range, contexts are here to allow more
+    unique identification of data points.
+
+    Unlike tags, which are stored before each data point, context is stored
+    only when it changes.
+
+    General structure of taged binary data can be described as this:
+
+          TaggedBinaryData
+            Signature             - four byte signature ($54, $42, $44, $53)
+            ContextGroup[]        - array of context groups
+            ClosingSequence       - bytes $FF, $80 (see further for details)
+
+      There can be no context group written, in which case the entire structure
+      consists only of signature and closing sequence.
+
+      The closing sequence consinsts of context tag ($FF), which marks a context
+      change, followed by context flags without an actual new context ID. In the
+      context flags, a close flag is set - this actually marks the end of tagged
+      data (usually no other flag is set, so the value $80).
+
+      Context group is a sequence of context tag, context flags, context ID and
+      an array of tagged data points:
+
+          ContextGroup
+            ContextTag            - tag of value $FF
+            ContextFlags          - flags for this context group
+            ContextID             - ID of this context group
+            TaggedDataPoint[]     - array of tagged data points
+
+      ... where TaggedDataPoint can be seen as:
+
+          TaggedDataPoint
+            Tag                   - tag for this data point
+            Data                  - actual data (of variable size)
+
+      Note that the first context group might not start with a ContextGroup
+      pseudostructure. Instead, it can only contain and array of tagged data
+      points. In such case, this group has an implicit ID of 0 and flags are
+      empty.
+
+      All metadata (signature, context ID) are written with little endianess.
+
+  Version 1.0 (2010-10-31)
+
+  Last change 2010-10-31
+
+  ©2021 František Milt
+
+  Contacts:
+    František Milt: frantisek.milt@gmail.com
+
+  Support:
+    If you find this code useful, please consider supporting its author(s) by
+    making a small donation using the following link(s):
+
+      https://www.paypal.me/FMilt
+
+  Changelog:
+    For detailed changelog and history please refer to this git repository:
+
+      github.com/TheLazyTomcat/Lib.TaggedBinaryData
+
+  Dependencies:
+    AuxTypes        - github.com/TheLazyTomcat/Lib.AuxTypes
+    AuxClasses      - github.com/TheLazyTomcat/Lib.AuxClasses
+    StrRect         - github.com/TheLazyTomcat/Lib.StrRect
+    BinaryStreaming - github.com/TheLazyTomcat/Lib.BinaryStreaming
+
+===============================================================================}
 unit TaggedBinaryData;
+
+{$IFDEF FPC}
+  {$MODE ObjFPC}
+{$ENDIF}
+{$H+}
 
 interface
 
 uses
   SysUtils, Classes,
-  AuxTypes;
+  AuxTypes, AuxClasses;
 
+{===============================================================================
+    Library-specific exceptions
+===============================================================================}
 type
   ETBDException = class(Exception);
 
@@ -14,21 +113,105 @@ type
   ETBDReadError  = class(ETBDException);
   ETBDWriteError = class(ETBDException);
 
+{===============================================================================
+    Common types and constants
+===============================================================================}
 type
   TTBDContextFlags = UInt8;
   TTBDContextID    = UInt16;
   TTBDTag          = UInt8;
 
 const
-  TBD_CTXFLAGS_FLAG_TERMINATE = TTBDContextFlags($80);
+  TBD_SIGNATURE = UInt32($53444254);  // TBDS when read as a string
 
-  TBD_TAG_CLOSE = TTBDTag(-1);
+  TBD_CTXFLAGS_FLAG_CLOSE = TTBDContextFlags($80);
+
+  TBD_TAG_CONTEXT = TTBDTag(-1);
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                             TTaggedBinaryDataWriter                                                                                               
+--------------------------------------------------------------------------------
+===============================================================================}
+{
+  Reading is not allowed in writer, a call to method Read (be it explicit or
+  implicit) will raise an ETBDReadError exception.
+
+  Seeking is directly passed to destination stream.
+
+  At the start, no context is written into destination, unless you explicitly
+  set it (first, implicit, context has ID of 0) - first written thing after
+  signature will be tag of the first data. If you do not set the tag before
+  writing data, it will be 0.
+
+  Writing of context and tag is deferred to next call of method Write. So no
+  matter how many times you call SetContext and SetTag, nothing will be written
+  into destination stream until you write some actual data, at which point only
+  the last set context and tag will be written.
+
+  It is possible to store compound data via multiple calls to write, only the
+  first write after SetTag will actually write the tag.
+
+  Even if you do not write anything, the signature and closing sequence will be
+  written.
+
+  An example on how to use the writer could be something like this (uses
+  BinaryStreaming library):
+
+      Writer := TTaggedBinaryDataWriter.Create(DestinationStream);
+      try
+        (* implicit context ID (0) *)
+        Stream_WriteInt16(Writer.SetTag(0),<value_C0_T0>);
+        Stream_WriteFloat32(Writer.SetTag(1),<value_C0_T1>);
+        Stream_WriteString(Writer.SetTag(2),<value_C0_T2>);
+
+        Writer.SetContext(1);
+        Stream_WriteAnsiChar(Writer.SetTag(0),<value_C1_T0>);
+
+        Writer.SetContext(22);
+        Stream_WriteInt64(Writer.SetTag(100),<value_C22_T100>);
+        Stream_WriteInt64(Writer.SetTag(200),<value_C22_T200>);
+      finally
+        Writer.Free;
+      end;
+
+    This will produce a following byte sequence in the destination stream:
+
+      5442445300<v0>01<v1>02<v3>FF00010000<v4>FF00160064<v5>C8<v6>FF80
+
+    ...where the bytes have following meanings:
+
+        54424453  - signature
+        00        - tag 0
+        <v0>      - value_C0_T0
+        01        - tag 1
+        <v1>      - value_C0_T1
+        02        - tag 2
+        <v3>      - value_C0_T2
+        FF        - context tag
+        00        - context flags
+        0100      - context ID 1
+        00        - tag 0
+        <v4>      - value_C1_T0
+        FF        - context tag
+        00        - context flags
+        1600      - context ID 22
+        64        - tag 100
+        <v5>      - value_C22_T100
+        C8        - tag 200
+        <v6>      - value_C22_T200
+        FF        - context tag
+        80        - context flags with close flag set
+}
 
 type
-  TTBDWriterAction = (waWriteInit,waWriteContext,waWriteTag);
+  TTBDWriterAction = (waWriteContext,waWriteTag);
 
   TTBDWriterActions = set of TTBDWriterAction;
 
+{===============================================================================
+    TTaggedBinaryDataWriter - class declaration
+===============================================================================}
 type
   TTaggedBinaryDataWriter = class(TStream)
   private
@@ -39,6 +222,7 @@ type
   protected
     procedure Initialize(Destination: TStream); virtual;
     procedure Finalize; virtual;
+    procedure WriteSignature; virtual;
     procedure WriteContext; virtual;
     procedure WriteTag; virtual;
     procedure WriteClose; virtual;
@@ -48,16 +232,16 @@ type
     Function Read(var Buffer; Count: LongInt): LongInt; override;
     Function Write(const Buffer; Count: LongInt): LongInt; override;
     Function Seek(const Offset: Int64; Origin: TSeekOrigin): Int64; override;
-    procedure SetNextContext(Context: TTBDContextID); virtual;
+    procedure SetContext(Context: TTBDContextID); virtual;
   {
-    SetNextTag returns reference to self, so it can be used for inline tag set
-    and write, for example:
+    SetTag returns reference to self, so it can be used for inline tag set and
+    write, for example:
 
-      Writer.SetNextTag(15).WriteBuffer(Buff,SizeOf(Buff));
+      Writer.SetTag(15).WriteBuffer(Buff,SizeOf(Buff));
 
     Of course, if you hate such constructs, do not use it ;)
   }
-    Function SetNextTag(Tag: TTBDTag): TStream; virtual;
+    Function SetTag(Tag: TTBDTag): TStream; virtual;
     property Destination: TStream read fDestination;
     property CurrentContext: TTBDContextID read fCurrentContext;
     property CurrentTag: TTBDTag read fCurrentTag;
@@ -66,10 +250,61 @@ type
   // shorter alias
   TTBDWriter = TTaggedBinaryDataWriter;
 
+{===============================================================================
+--------------------------------------------------------------------------------
+                             TTaggedBinaryDataReader
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TTaggedBinaryDataReader - class declaration
+===============================================================================}
+type
+  TTaggedBinaryDataReader = class(TStream)
+  private
+    fSource:                TStream;
+    fEndOfDataReached:      Boolean;
+    fCurrentContext:        TTBDContextID;
+    fCurrentTag:            TTBDTag;
+    fContextChangeEvent:    TNotifyEvent;
+    fContextChangeCallback: TNotifyCallback;
+  protected
+    procedure Initialize(Source: TStream); virtual;
+    procedure Finalize; virtual;
+    procedure DoContextChange; virtual;
+  public
+    constructor Create(Source: TStream);
+    destructor Destroy; override;
+    Function Read(var Buffer; Count: LongInt): LongInt; override;
+    Function Write(const Buffer; Count: LongInt): LongInt; override;
+    Function Seek(const Offset: Int64; Origin: TSeekOrigin): Int64; override;
+    Function GetTag: Boolean; virtual;
+    property Source: TStream read fSource;
+    property EndOfDataReached: Boolean read fEndOfDataReached;
+    property CurrentContext: TTBDContextID read fCurrentContext;
+    property CurrentTag: TTBDTag read fCurrentTag;
+    property OnContextChangeEvent: TNotifyEvent read fContextChangeEvent write fContextChangeEvent;
+    property OnContextChangeCallback: TNotifyCallback read fContextChangeCallback write fContextChangeCallback;
+    property OnContextChange: TNotifyEvent read fContextChangeEvent write fContextChangeEvent;
+  end;
+
+  TTBDReader = TTaggedBinaryDataReader;
+
 implementation
 
 uses
   BinaryStreaming;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                             TTaggedBinaryDataWriter                                                                                               
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TTaggedBinaryDataWriter - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TTaggedBinaryDataWriter - protected methods
+-------------------------------------------------------------------------------}
 
 procedure TTaggedBinaryDataWriter.Initialize(Destination: TStream);
 begin
@@ -77,9 +312,10 @@ If Assigned(Destination) then
   fDestination := Destination
 else
   raise ETBDInvalidValue.Create('TTaggedBinaryDataWriter.Initialize: Destination stream not assigned.');
-fActions := [waWriteInit];
+fActions := [waWriteTag];
 fCurrentContext := 0;
 fCurrentTag := 0;
+WriteSignature;
 end;
 
 //------------------------------------------------------------------------------
@@ -93,6 +329,13 @@ end;
 
 //------------------------------------------------------------------------------
 
+procedure TTaggedBinaryDataWriter.WriteSignature;
+begin
+Stream_WriteUInt32(fDestination,TBD_SIGNATURE);
+end;
+
+//------------------------------------------------------------------------------
+
 procedure TTaggedBinaryDataWriter.WriteContext;
 
   Function GetContextFlags: TTBDContextFlags;
@@ -101,7 +344,7 @@ procedure TTaggedBinaryDataWriter.WriteContext;
   end;
 
 begin
-Stream_WriteUInt8(fDestination,TBD_TAG_CLOSE);
+Stream_WriteUInt8(fDestination,TBD_TAG_CONTEXT);
 Stream_WriteUInt8(fDestination,GetContextFlags);
 Stream_WriteUInt16(fDestination,fCurrentContext);
 Exclude(fActions,waWriteContext);
@@ -118,23 +361,16 @@ end;
 //------------------------------------------------------------------------------
 
 procedure TTaggedBinaryDataWriter.WriteClose;
-var
-  FlagsTemp:  TTBDContextFlags;
 begin
-{
-  If waWriteInit is still in actions, then absolutely nothing was written
-  into destination up to this point, so keep it at that.
-}
-If not(waWriteInit in fActions) then
-  begin
-    // write closing tag
-    Stream_WriteUInt8(fDestination,TBD_TAG_CLOSE);
-    // write terminating context flags without context id
-    Stream_WriteUInt8(fDestination,TBD_CTXFLAGS_FLAG_TERMINATE);
-  end;
+// write closing tag
+Stream_WriteUInt8(fDestination,TBD_TAG_CONTEXT);
+// write terminating context flags without context id
+Stream_WriteUInt8(fDestination,TBD_CTXFLAGS_FLAG_CLOSE);
 end;
 
-//==============================================================================
+{-------------------------------------------------------------------------------
+    TTaggedBinaryDataWriter - public methods
+-------------------------------------------------------------------------------}
 
 constructor TTaggedBinaryDataWriter.Create(Destination: TStream);
 begin
@@ -154,14 +390,13 @@ end;
 
 Function TTaggedBinaryDataWriter.Read(var Buffer; Count: LongInt): LongInt;
 begin
-raise ETBDReadError.Create('TTBDWriter.Read: Reading not allowed.');
+raise ETBDReadError.Create('TTaggedBinaryDataWriter.Read: Reading not allowed.');
 end;
 
 //------------------------------------------------------------------------------
 
 Function TTaggedBinaryDataWriter.Write(const Buffer; Count: LongInt): LongInt;
 begin
-Exclude(fActions,waWriteInit);
 If waWriteContext in fActions then
   WriteContext;
 If waWriteTag in fActions then
@@ -178,7 +413,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TTaggedBinaryDataWriter.SetNextContext(Context: TTBDContextID);
+procedure TTaggedBinaryDataWriter.SetContext(Context: TTBDContextID);
 begin
 Include(fActions,waWriteContext);
 fCurrentContext := Context;
@@ -186,15 +421,154 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TTaggedBinaryDataWriter.SetNextTag(Tag: TTBDTag): TStream;
+Function TTaggedBinaryDataWriter.SetTag(Tag: TTBDTag): TStream;
 begin
-If Tag <> TBD_TAG_CLOSE then
+If Tag <> TBD_TAG_CONTEXT then
   begin
     Include(fActions,waWriteTag);
     fCurrentTag := Tag;
     Result := Self;
   end
-else raise ETBDInvalidValue.CreateFmt('TTBDWriter.SetNewTag: Invalid tag (0x%.2x).',[Tag]);
+else raise ETBDInvalidValue.CreateFmt('TTaggedBinaryDataWriter.SetNewTag: Invalid tag (0x%.2x).',[Tag]);
+end;
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                             TTaggedBinaryDataReader
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TTaggedBinaryDataReader - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TTaggedBinaryDataReader - protected methods
+-------------------------------------------------------------------------------}
+
+procedure TTaggedBinaryDataReader.Initialize(Source: TStream);
+var
+  temp: uint32;
+begin
+If Assigned(Source) then
+  fSource := Source
+else
+  raise ETBDInvalidValue.Create('TTaggedBinaryDataReader.Initialize: Source stream not assigned.');
+{
+  Check if the source can contain a valid TBD stream, and if so whether it
+  starts with a proper signature.
+}
+If (fSource.Size - fSource.Position) >= 6 {4B signature, 2B closing sequence} then
+  begin
+    Temp := Stream_ReadUInt32(fSource);
+    fEndOfDataReached := Temp <> TBD_SIGNATURE;
+    If fEndOfDataReached then
+      fSource.Seek(-SizeOf(UInt32),soCurrent);
+  end
+else fEndOfDataReached := False;
+// init other fields
+fCurrentContext := 0;
+fCurrentTag := 0;
+fContextChangeEvent := nil;
+fContextChangeCallback := nil;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TTaggedBinaryDataReader.Finalize;
+begin
+fContextChangeEvent := nil;
+fContextChangeCallback := nil;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TTaggedBinaryDataReader.DoContextChange;
+begin
+If Assigned(fContextChangeEvent) then
+  fContextChangeEvent(Self);
+If Assigned(fContextChangeCallback) then
+  fContextChangeCallback(Self);
+end;
+
+{-------------------------------------------------------------------------------
+    TTaggedBinaryDataReader - public methods
+-------------------------------------------------------------------------------}
+
+constructor TTaggedBinaryDataReader.Create(Source: TStream);
+begin
+inherited Create;
+Initialize(Source);
+end;
+
+//------------------------------------------------------------------------------
+
+destructor TTaggedBinaryDataReader.Destroy;
+begin
+Finalize;
+inherited;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TTaggedBinaryDataReader.Read(var Buffer; Count: LongInt): LongInt;
+begin
+Result := fSource.Read(Buffer,Count);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TTaggedBinaryDataReader.Write(const Buffer; Count: LongInt): LongInt;
+begin
+raise ETBDReadError.Create('TTaggedBinaryDataReader.Write: Writing not allowed.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function TTaggedBinaryDataReader.Seek(const Offset: Int64; Origin: TSeekOrigin): Int64;
+begin
+Result := fSource.Seek(Offset,Origin);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TTaggedBinaryDataReader.GetTag: Boolean;
+
+  procedure ReachedEnd;
+  begin
+    fEndOfDataReached := True;
+    Result{ReadTag} := False;
+  end;
+
+begin
+If not fEndOfDataReached then
+  begin
+    If (fSource.Size - fSource.Position) >= SizeOf(TTBDTag) then
+      begin
+        // tag can fit in the rest of the stream after current position
+        fCurrentTag := Stream_ReadUInt8(fSource);
+        If fCurrentTag = TBD_TAG_CONTEXT then
+          begin
+            If (fSource.Size - fSource.Position) >= SizeOf(TTBDContextFlags) then
+              If (Stream_ReadUInt8(fSource) and TBD_CTXFLAGS_FLAG_CLOSE) = 0 then
+                If (fSource.Size - fSource.Position) >= SizeOf(TTBDContextID) then
+                  begin
+                    fCurrentContext := Stream_ReadUInt16(fSource);
+                    DoContextChange;
+                  {
+                    Recursively call ReadTag again to read next thing after the
+                    context change (whatever it will be).
+                  }
+                    Result := GetTag;
+                    Exit;
+                  end;
+            ReachedEnd;
+          end
+        // non-context tag read
+        else Result := True;
+      end
+    // tag cannot fit
+    else ReachedEnd;
+  end
+else Result := False;
 end;
 
 end.
