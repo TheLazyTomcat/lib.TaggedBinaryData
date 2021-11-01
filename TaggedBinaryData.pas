@@ -9,21 +9,22 @@
 
   TaggedBinaryData
 
-    Set of simple classes (descendants of TStream) intended for serialization
-    and deserialization of binary data into/from streams.
+    Set of very simple classes (descendants of TStream) intended for
+    serialization and deserialization of binary data into/from streams.
 
     Each data point is stored with its tag and the tagged values are split
     into groups called contexts.
 
-    Tag is an 8bit integer (byte) that can have value between 0 and 254. Value
-    of 255 is reserved for a context tag - this tag signals that next byte(s)
-    are not data, but a new context.
-    Context is a 16bit integer that can be set to any value (none is reserved).
-    Since the tag has very limited range, contexts are here to allow more
-    unique identification of data points.
+    Tag is an 8bit unsigned integer (byte) that can have value between 0 and
+    254. Value of 255 is reserved for a context tag - this tag signals that
+    next byte(s) are not data, but a new context.
+    Context is a 16bit unsigned integer that can be set to any value (none is
+    reserved). Since the tag has very limited range, contexts are here to allow
+    more unique identification of data points.
 
     Unlike tags, which are stored before each data point, context is stored
-    only when it changes.
+    only when it changes. You should refrain from changing it too often, as
+    each context change stores 4 more bytes into the resulting stream.
 
     General structure of taged binary data can be described as this:
 
@@ -62,9 +63,9 @@
 
       All metadata (signature, context ID) are written with little endianess.
 
-  Version 1.0 (2010-10-31)
+  Version 1.0 (2010-11-01)
 
-  Last change 2010-10-31
+  Last change 2010-11-01
 
   ©2021 František Milt
 
@@ -93,6 +94,8 @@ unit TaggedBinaryData;
 
 {$IFDEF FPC}
   {$MODE ObjFPC}
+  {$DEFINE FPC_DisableWarns}
+  {$MACRO ON}
 {$ENDIF}
 {$H+}
 
@@ -152,7 +155,7 @@ const
   It is possible to store compound data via multiple calls to write, only the
   first write after SetTag will actually write the tag.
 
-  Even if you do not write anything, the signature and closing sequence will be
+  Even if you do not write any data, the signature and closing sequence will be
   written.
 
   An example on how to use the writer could be something like this (uses
@@ -255,6 +258,55 @@ type
                              TTaggedBinaryDataReader
 --------------------------------------------------------------------------------
 ===============================================================================}
+{
+  Writing is not allowed in reader, a call to method Write (be it explicit or
+  implicit) will raise an ETBDWriteError exception.
+
+  Both seeking and reading are directly passed to source stream.
+
+  To properly use the reader, call method GetTag once (and only once) before
+  every data point. This method will try to load next stored tag and, if
+  necessary, a new context information.
+
+  When GetTag returns true, it indicates that a tag was read and properties
+  CurrentContext and CurrentTag now contains proper values. Use those values
+  to discern which data point to read next. Size of the data point is not
+  managed by this library so you are responsible to read proper number of bytes
+  (if you fail to do so, you will damage the reading process and further
+  behavior of the reader is completely undefined).
+
+  When it returns false, it indicates either end of source stream or end of
+  tagged binary data stream pseudostructure (this is also indicated by property
+  EndOfDataReached). In any case, you should stop reading any further data
+  points. Also, in this situation, values stored in properties CurrentContext
+  and CurrentTag are undefined.
+
+  An example how to use the reader could be (note that it is reading the same
+  data that would be stored in the example for writer - see above):
+
+      Reader := TTaggedBinaryDataReader.Create(SourceStream);
+      try
+        while Reader.GetTag do
+          case Reader.CurrentContext of
+             0: case Reader.CurrentTag of
+                  0:  <value_C0_T0> := Stream_ReadInt16(Reader);
+                  1:  <value_C0_T1> := Stream_ReadFloat32(Reader);
+                  2:  <value_C0_T2> := Stream_ReadString(Reader);
+                end;
+             1: If Reader.CurrentTag = 0 then
+                  <value_C1_T0> := Stream_ReadAnsiChar(Reader);
+            22: case Reader.CurrentTag of
+                  100:  <value_C22_T100> := Stream_ReadInt64(Reader);
+                  200:  <value_C22_T200> := Stream_ReadInt64(Reader);
+                end;
+          end;
+      finally
+        Reader.Free;
+      end;
+
+    This is just one possible approach, you can create your own implementation
+    (for example using provided events fired on context and tag change).
+}
 {===============================================================================
     TTaggedBinaryDataReader - class declaration
 ===============================================================================}
@@ -265,12 +317,16 @@ type
     fEndOfDataReached:      Boolean;
     fCurrentContext:        TTBDContextID;
     fCurrentTag:            TTBDTag;
+    fIsDefaultContext:      Boolean;
     fContextChangeEvent:    TNotifyEvent;
     fContextChangeCallback: TNotifyCallback;
+    fTagChangeEvent:        TNotifyEvent;
+    fTagChangeCallback:     TNotifyCallback;
   protected
     procedure Initialize(Source: TStream); virtual;
     procedure Finalize; virtual;
     procedure DoContextChange; virtual;
+    procedure DoTagChange; virtual;
   public
     constructor Create(Source: TStream);
     destructor Destroy; override;
@@ -285,6 +341,9 @@ type
     property OnContextChangeEvent: TNotifyEvent read fContextChangeEvent write fContextChangeEvent;
     property OnContextChangeCallback: TNotifyCallback read fContextChangeCallback write fContextChangeCallback;
     property OnContextChange: TNotifyEvent read fContextChangeEvent write fContextChangeEvent;
+    property OnTagChangeEvent: TNotifyEvent read fTagChangeEvent write fTagChangeEvent;
+    property OnTagChangeCallback: TNotifyCallback read fTagChangeCallback write fTagChangeCallback;
+    property OnTagChange: TNotifyEvent read fTagChangeEvent write fTagChangeEvent;
   end;
 
   TTBDReader = TTaggedBinaryDataReader;
@@ -293,6 +352,11 @@ implementation
 
 uses
   BinaryStreaming;
+
+{$IFDEF FPC_DisableWarns}
+  {$DEFINE FPCDWM}
+  {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
+{$ENDIF}
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -388,10 +452,15 @@ end;
 
 //------------------------------------------------------------------------------
 
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
 Function TTaggedBinaryDataWriter.Read(var Buffer; Count: LongInt): LongInt;
 begin
+{$IFDEF FPC}
+Result := 0;
+{$ENDIF}
 raise ETBDReadError.Create('TTaggedBinaryDataWriter.Read: Reading not allowed.');
 end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 
 //------------------------------------------------------------------------------
 
@@ -464,11 +533,14 @@ If (fSource.Size - fSource.Position) >= 6 {4B signature, 2B closing sequence} th
       fSource.Seek(-SizeOf(UInt32),soCurrent);
   end
 else fEndOfDataReached := False;
+fIsDefaultContext := True;
 // init other fields
 fCurrentContext := 0;
 fCurrentTag := 0;
 fContextChangeEvent := nil;
 fContextChangeCallback := nil;
+fTagChangeEvent := nil;
+fTagChangeCallback := nil;
 end;
 
 //------------------------------------------------------------------------------
@@ -477,6 +549,8 @@ procedure TTaggedBinaryDataReader.Finalize;
 begin
 fContextChangeEvent := nil;
 fContextChangeCallback := nil;
+fTagChangeEvent := nil;
+fTagChangeCallback := nil;
 end;
 
 //------------------------------------------------------------------------------
@@ -487,6 +561,17 @@ If Assigned(fContextChangeEvent) then
   fContextChangeEvent(Self);
 If Assigned(fContextChangeCallback) then
   fContextChangeCallback(Self);
+fIsDefaultContext := False;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TTaggedBinaryDataReader.DoTagChange;
+begin
+If Assigned(fTagChangeEvent) then
+  fTagChangeEvent(Self);
+If Assigned(fTagChangeCallback) then
+  fTagChangeCallback(Self);
 end;
 
 {-------------------------------------------------------------------------------
@@ -516,10 +601,15 @@ end;
 
 //------------------------------------------------------------------------------
 
+{$IFDEF FPCDWM}{$PUSH}W5024{$ENDIF}
 Function TTaggedBinaryDataReader.Write(const Buffer; Count: LongInt): LongInt;
 begin
-raise ETBDReadError.Create('TTaggedBinaryDataReader.Write: Writing not allowed.');
+{$IFDEF FPC}
+Result := 0;
+{$ENDIF}
+raise ETBDWriteError.Create('TTaggedBinaryDataReader.Write: Writing not allowed.');
 end;
+{$IFDEF FPCDWM}{$POP}{$ENDIF}
 
 //------------------------------------------------------------------------------
 
@@ -531,14 +621,8 @@ end;
 //------------------------------------------------------------------------------
 
 Function TTaggedBinaryDataReader.GetTag: Boolean;
-
-  procedure ReachedEnd;
-  begin
-    fEndOfDataReached := True;
-    Result{ReadTag} := False;
-  end;
-
 begin
+Result := False;
 If not fEndOfDataReached then
   begin
     If (fSource.Size - fSource.Position) >= SizeOf(TTBDTag) then
@@ -556,19 +640,28 @@ If not fEndOfDataReached then
                   {
                     Recursively call ReadTag again to read next thing after the
                     context change (whatever it will be).
+
+                    Note the brackets must be there for FPC - otherwise GetTag
+                    is parsed as a result of this function (Boolean), not as a
+                    call to it.
                   }
-                    Result := GetTag;
+                    Result := GetTag();
                     Exit;
                   end;
-            ReachedEnd;
+            fEndOfDataReached := True;
           end
-        // non-context tag read
-        else Result := True;
+        else
+          begin
+            // non-context tag read
+            If fIsDefaultContext then
+              DoContextChange;
+            DoTagChange;
+            Result := True;
+          end;
       end
     // tag cannot fit
-    else ReachedEnd;
-  end
-else Result := False;
+    else fEndOfDataReached := True;
+  end;
 end;
 
 end.
