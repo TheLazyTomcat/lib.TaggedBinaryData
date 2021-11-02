@@ -638,7 +638,7 @@ If not fEndOfDataReached then
                     fCurrentContext := Stream_ReadUInt16(fSource);
                     DoContextChange;
                   {
-                    Recursively call ReadTag again to read next thing after the
+                    Recursively call GetTag again to read next thing after the
                     context change (whatever it will be).
 
                     Note the brackets must be there for FPC - otherwise GetTag
