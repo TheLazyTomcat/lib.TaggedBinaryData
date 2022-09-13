@@ -63,11 +63,11 @@
 
       All metadata (signature, context ID) are written with little endianess.
 
-  Version 1.0 (2010-11-01)
+  Version 1.0 (2021-11-01)
 
-  Last change 2010-11-01
+  Last change 2022-09-14
 
-  ©2021 František Milt
+  ©2022 František Milt
 
   Contacts:
     František Milt: frantisek.milt@gmail.com
@@ -217,12 +217,11 @@ type
 ===============================================================================}
 type
   TTaggedBinaryDataWriter = class(TStream)
-  private
+  protected
     fDestination:     TStream;
     fActions:         TTBDWriterActions;
     fCurrentContext:  TTBDContextID;
     fCurrentTag:      TTBDTag;
-  protected
     procedure Initialize(Destination: TStream); virtual;
     procedure Finalize; virtual;
     procedure WriteSignature; virtual;
@@ -312,7 +311,7 @@ type
 ===============================================================================}
 type
   TTaggedBinaryDataReader = class(TStream)
-  private
+  protected
     fSource:                TStream;
     fEndOfDataReached:      Boolean;
     fCurrentContext:        TTBDContextID;
@@ -322,7 +321,6 @@ type
     fContextChangeCallback: TNotifyCallback;
     fTagChangeEvent:        TNotifyEvent;
     fTagChangeCallback:     TNotifyCallback;
-  protected
     procedure Initialize(Source: TStream); virtual;
     procedure Finalize; virtual;
     procedure DoContextChange; virtual;
@@ -558,8 +556,8 @@ end;
 procedure TTaggedBinaryDataReader.DoContextChange;
 begin
 If Assigned(fContextChangeEvent) then
-  fContextChangeEvent(Self);
-If Assigned(fContextChangeCallback) then
+  fContextChangeEvent(Self)
+else If Assigned(fContextChangeCallback) then
   fContextChangeCallback(Self);
 fIsDefaultContext := False;
 end;
@@ -569,8 +567,8 @@ end;
 procedure TTaggedBinaryDataReader.DoTagChange;
 begin
 If Assigned(fTagChangeEvent) then
-  fTagChangeEvent(Self);
-If Assigned(fTagChangeCallback) then
+  fTagChangeEvent(Self)
+else If Assigned(fTagChangeCallback) then
   fTagChangeCallback(Self);
 end;
 
